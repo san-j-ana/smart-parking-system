@@ -1,0 +1,154 @@
+PARKING CODE
+
+                                                                                                                                                                                                                                                                                           #include "contiki.h"
+#include "net/routing/routing.h"
+#include "net/ipv6/uip.h"
+#include "net/ipv6/uip-udp-packet.h"
+#include "net/linkaddr.h"  // For node_id
+#include <stdio.h>
+#include <string.h>
+
+#define UDP_CLIENT_PORT 8765
+#define UDP_SERVER_PORT 5678
+#define SEND_INTERVAL (30 * CLOCK_SECOND)
+
+PROCESS(parking_sensor_process, "Parking Sensor Node");
+AUTOSTART_PROCESSES(&parking_sensor_process);
+
+static struct uip_udp_conn *client_conn;
+static struct etimer periodic_timer;
+
+static int car_present = 0;
+static int is_disabled_spot = 0; // 0 = normal, 1 = disabled
+
+PROCESS_THREAD(parking_sensor_process, ev, data)
+{
+  uip_ipaddr_t dest_ipaddr;
+  static char msg[40];
+
+  PROCESS_BEGIN();
+
+  // Assign type based on mote ID
+  int node_id = linkaddr_node_addr.u8[7];  // Typically last byte of address
+if(node_id == 2 || node_id == 4)
+ {
+    is_disabled_spot = 1;
+  } else {
+    is_disabled_spot = 0;
+  }
+
+  printf("Mote ID: %d, Type: %d\n", node_id, is_disabled_spot);
+
+  client_conn = udp_new(NULL, UIP_HTONS(UDP_SERVER_PORT), NULL);
+  udp_bind(client_conn, UIP_HTONS(UDP_CLIENT_PORT));
+
+  etimer_set(&periodic_timer, SEND_INTERVAL);
+
+  while(1) {
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&periodic_timer));
+
+    car_present = !car_present; // simulate car arrival/departure
+
+    if(NETSTACK_ROUTING.node_is_reachable() &&
+       NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
+
+      snprintf(msg, sizeof(msg), "type:%d,spot:%d", is_disabled_spot, car_present);
+      uip_udp_packet_sendto(client_conn, msg, strlen(msg),
+                            &dest_ipaddr, UIP_HTONS(UDP_SERVER_PORT));
+
+      printf("Sensor: Sent status %s\n", msg);
+    } else {
+      printf("Sensor: RPL root not reachable yet\n");
+    }
+
+    etimer_reset(&periodic_timer);
+  }
+
+  PROCESS_END();
+}
+
+
+
+
+
+
+SINK CODE
+
+#include "contiki.h"
+#include "net/routing/routing.h"
+#include "net/netstack.h"
+#include "net/ipv6/uip.h"
+#include "net/ipv6/uip-udp-packet.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MAX_SPOTS 10
+#define UDP_SERVER_PORT 5678
+
+PROCESS(sink_server_process, "Smart Parking Sink");
+AUTOSTART_PROCESSES(&sink_server_process);
+
+static struct uip_udp_conn *server_conn;
+
+struct spot_info {
+  int is_disabled; // 0 = normal, 1 = disabled
+  int status;      // 0 = vacant, 1 = occupied
+};
+
+static struct spot_info spots[MAX_SPOTS];
+
+PROCESS_THREAD(sink_server_process, ev, data)
+{
+  PROCESS_BEGIN();
+
+  NETSTACK_ROUTING.root_start();
+
+  server_conn = udp_new(NULL, UIP_HTONS(UDP_SERVER_PORT), NULL);
+  udp_bind(server_conn, UIP_HTONS(UDP_SERVER_PORT));
+
+  printf("Sink: Smart Parking Server Started\n");
+
+  while(1) {
+    PROCESS_YIELD();
+
+    if(ev == tcpip_event && uip_newdata()) {
+      char *recv_data = (char *)uip_appdata;
+      recv_data[uip_datalen()] = '\0';
+
+      int id = UIP_IP_BUF->srcipaddr.u8[15]; // Last byte = mote ID
+      int type = 0, spot = 0;
+char *token;
+token = strtok(recv_data, ",");
+while(token != NULL) {
+  if(strncmp(token, "type:", 5) == 0) {
+    type = atoi(token + 5);
+  } else if(strncmp(token, "spot:", 5) == 0) {
+    spot = atoi(token + 5);
+  }
+  token = strtok(NULL, ",");
+}
+
+      spots[id].is_disabled = type;
+      spots[id].status = spot;
+
+      printf("Sink: Received from Mote %d -> Disabled: %d | Occupied: %d\n",
+             id, spots[id].is_disabled, spots[id].status);
+
+      // Assign spot for incoming vehicle
+      int need_disabled_spot = 1; // Simulate if the car is a disabled driver
+      printf("Sink: Checking for suitable spot...\n");
+
+      for(int i = 2; i < MAX_SPOTS; i++) {
+        if(spots[i].status == 0 &&
+           ((need_disabled_spot && spots[i].is_disabled) ||
+           (!need_disabled_spot && !spots[i].is_disabled))) {
+          printf("Sink: Assigned Spot Mote %d (Disabled: %d)\n", i, spots[i].is_disabled);
+          break;
+        }
+      }
+    }
+  }
+
+  PROCESS_END();
+}
